@@ -88,6 +88,8 @@ import scala.util.control.ControlThrowable
  * @param logDirs The directories where offset checkpoints reside
  * @param logs The pool of logs
  * @param time A way to control the passage of time
+ *
+ * 这个是compact模式下的清道夫
  */
 class LogCleaner(initialConfig: CleanerConfig,
                  val logDirs: Seq[File],

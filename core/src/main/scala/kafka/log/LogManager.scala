@@ -45,24 +45,32 @@ import scala.util.{Failure, Success, Try}
  * size or I/O rate.
  *
  * A background thread handles log retention by periodically truncating excess log segments.
+
+ * logManager负责log的创建, 重试, 清理.
+ * 把所有的读写请求导入到独立的的log对象上去.
+
+ * 因为logDir可以配多个, 然后logManager创建新log(partition)的时候会选择数据量最少的文件夹.
+
+ * 有一个后台线程负责定期清洗log segments.
  */
 @threadsafe
-class LogManager(logDirs: Seq[File],
-                 initialOfflineDirs: Seq[File],
-                 val topicConfigs: Map[String, LogConfig], // note that this doesn't get updated after creation
-                 val initialDefaultConfig: LogConfig,
-                 val cleanerConfig: CleanerConfig,
-                 recoveryThreadsPerDataDir: Int,
-                 val flushCheckMs: Long,
-                 val flushRecoveryOffsetCheckpointMs: Long,
-                 val flushStartOffsetCheckpointMs: Long,
-                 val retentionCheckMs: Long,
-                 val maxPidExpirationMs: Int,
-                 scheduler: Scheduler,
-                 val brokerState: BrokerState,
-                 brokerTopicStats: BrokerTopicStats,
-                 logDirFailureChannel: LogDirFailureChannel,
-                 time: Time) extends Logging with KafkaMetricsGroup {
+class LogManager(
+                  logDirs: Seq[File],
+                  initialOfflineDirs: Seq[File],
+                  val topicConfigs: Map[String, LogConfig], // note that this doesn't get updated after creation
+                  val initialDefaultConfig: LogConfig,
+                  val cleanerConfig: CleanerConfig,
+                  recoveryThreadsPerDataDir: Int,
+                  val flushCheckMs: Long,
+                  val flushRecoveryOffsetCheckpointMs: Long,
+                  val flushStartOffsetCheckpointMs: Long,
+                  val retentionCheckMs: Long,
+                  val maxPidExpirationMs: Int,
+                  scheduler: Scheduler,
+                  val brokerState: BrokerState,
+                  brokerTopicStats: BrokerTopicStats,
+                  logDirFailureChannel: LogDirFailureChannel,
+                  time: Time) extends Logging with KafkaMetricsGroup {
 
   import LogManager._
 
@@ -70,18 +78,24 @@ class LogManager(logDirs: Seq[File],
   val InitialTaskDelayMs = 30 * 1000
 
   private val logCreationOrDeletionLock = new Object
+  // 这个看起来是维护了所有的tp和对应的log对象
   private val currentLogs = new Pool[TopicPartition, Log]()
   // Future logs are put in the directory with "-future" suffix. Future log is created when user wants to move replica
   // from one log directory to another log directory on the same broker. The directory of the future log will be renamed
   // to replace the current log of the partition after the future log catches up with the current log
+  // 用户想要移动partitionLog文件了, 就会用到这个futureLogs集合, 这个应该是用到了双写, 等-future文件夹下的log跟上来就替换掉了.
   private val futureLogs = new Pool[TopicPartition, Log]()
+
   // Each element in the queue contains the log object to be deleted and the time it is scheduled for deletion.
+  // 需要干掉的Log对象, 还有要干掉的时间
   private val logsToBeDeleted = new LinkedBlockingQueue[(Log, Long)]()
 
+  // 校验一下, 然后把正常的目录都包装成对象.
   private val _liveLogDirs: ConcurrentLinkedQueue[File] = createAndValidateLogDirs(logDirs, initialOfflineDirs)
   @volatile private var _currentDefaultConfig = initialDefaultConfig
   @volatile private var numRecoveryThreadsPerDataDir = recoveryThreadsPerDataDir
 
+  // 这里面包含所有的正在生成Log的partition,
   // This map contains all partitions whose logs are getting loaded and initialized. If log configuration
   // of these partitions get updated at the same time, the corresponding entry in this map is set to "true",
   // which triggers a config reload after initialization is finished (to get the latest config value).
@@ -116,15 +130,18 @@ class LogManager(logDirs: Seq[File],
     logDirsSet
   }
 
+  // 这里是把本地村的log的信息都加载出来了, 也就是把<tp, log>之类的map都搞出来, 别人就能正常读写了.
+  // !注意: 只会校验一下, 然后创建出每个partition对应的Log对象, log对象里面只放着我们期待的offset, 不会真实的去校验/恢复数据.
   loadLogs()
 
+  // 建立一个清道夫.
   private[kafka] val cleaner: LogCleaner =
     if (cleanerConfig.enableCleaner)
       new LogCleaner(cleanerConfig, liveLogDirs, currentLogs, logDirFailureChannel, time = time)
     else
       null
 
-  newGauge("OfflineLogDirectoryCount", () => offlineLogDirs.size)
+  newGauge("OfflineLogDirectoryCount", () => offlineLogDirs.size) // 暴露出一个metrics
 
   for (dir <- logDirs) {
     newGauge("LogDirectoryOffline",
@@ -139,6 +156,7 @@ class LogManager(logDirs: Seq[File],
    * <li> Create each directory if it doesn't exist
    * <li> Check that each path is a readable directory
    * </ol>
+    一般到这里了就是一个目录, 要是有多个磁盘, 肯定就配置多个目录了.
    */
   private def createAndValidateLogDirs(dirs: Seq[File], initialOfflineDirs: Seq[File]): ConcurrentLinkedQueue[File] = {
     val liveLogDirs = new ConcurrentLinkedQueue[File]()
@@ -146,15 +164,18 @@ class LogManager(logDirs: Seq[File],
 
     for (dir <- dirs) {
       try {
+        // 校验下线的目录. 就是不能有下线的目录.
         if (initialOfflineDirs.contains(dir))
           throw new IOException(s"Failed to load ${dir.getAbsolutePath} during broker startup")
 
+        // 目录不存在就创建, 创建不出来就报错.
         if (!dir.exists) {
           info(s"Log directory ${dir.getAbsolutePath} not found, creating it.")
           val created = dir.mkdirs()
           if (!created)
             throw new IOException(s"Failed to create data directory ${dir.getAbsolutePath}")
         }
+        // 目录不能访问也会报错.
         if (!dir.isDirectory || !dir.canRead)
           throw new IOException(s"${dir.getAbsolutePath} is not a readable log directory.")
 
@@ -222,7 +243,7 @@ class LogManager(logDirs: Seq[File],
       }}
 
       warn(s"Logs for partitions ${offlineCurrentTopicPartitions.mkString(",")} are offline and " +
-           s"logs for future partitions ${offlineFutureTopicPartitions.mkString(",")} are offline due to failure on log directory $dir")
+        s"logs for future partitions ${offlineFutureTopicPartitions.mkString(",")} are offline due to failure on log directory $dir")
       dirLocks.filter(_.file.getParent == dir).foreach(dir => CoreUtils.swallow(dir.destroy(), this))
     }
   }
@@ -253,30 +274,37 @@ class LogManager(logDirs: Seq[File],
   // Only for testing
   private[log] def hasLogsToBeDeleted: Boolean = !logsToBeDeleted.isEmpty
 
+  // load一个文件夹, 一个文件夹就是一个partition.
   private def loadLog(logDir: File,
                       recoveryPoints: Map[TopicPartition, Long],
                       logStartOffsets: Map[TopicPartition, Long]): Log = {
+    // 文件名字应该是 {topicName}-{partition}.log这样子
     val topicPartition = Log.parseTopicPartitionName(logDir)
     val config = topicConfigs.getOrElse(topicPartition.topic, currentDefaultConfig)
+    // 恢复的起点, 如果没有就从0开始恢复.
     val logRecoveryPoint = recoveryPoints.getOrElse(topicPartition, 0L)
     val logStartOffset = logStartOffsets.getOrElse(topicPartition, 0L)
 
+    // 创建一个log对象, 这个其实就是一个partition一个对象, 因为logDir里面的dir就是一个partition
     val log = Log(
-      dir = logDir,
-      config = config,
-      logStartOffset = logStartOffset,
-      recoveryPoint = logRecoveryPoint,
-      maxProducerIdExpirationMs = maxPidExpirationMs,
+      dir = logDir,  // partition的文件夹目录
+      config = config, // 这个是topic的配置. 从zk上拿下来的这个topic的配置
+      logStartOffset = logStartOffset, // 这个partition的log开始的offset
+      recoveryPoint = logRecoveryPoint, // 我们要恢复的起始点
+      maxProducerIdExpirationMs = maxPidExpirationMs, // 不知道什么意思. producerId被认为过期的时间, 这个有什么用?
       producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
       scheduler = scheduler,
       time = time,
-      brokerTopicStats = brokerTopicStats,
-      logDirFailureChannel = logDirFailureChannel)
+      brokerTopicStats = brokerTopicStats, // 一个公用的状态机, 现在好像是..忘记了, 就是恢复状态?
+      logDirFailureChannel = logDirFailureChannel // 一个下线目录的集合/.
+    )
 
+    // 如果当前的partition目录, 是'-delete'结尾的, 就把log对象放在delete队列里, 有个定时任务不断地在删除: kafka-delete-logs
     if (logDir.getName.endsWith(Log.DeleteDirSuffix)) {
       addLogToBeDeleted(log)
     } else {
       val previous = {
+        // 这个只是放在对应的队列里, 谁会负责加载呢?????????????????
         if (log.isFuture)
           this.futureLogs.put(topicPartition, log)
         else
@@ -298,6 +326,7 @@ class LogManager(logDirs: Seq[File],
 
   /**
    * Recover and load all logs in the given data directories
+   * 刚启动, 先把本地的信息恢复出来. 只会校验一下, 然后创建出每个partition对应的Log对象, log对象里面只放着我们期待的offset, 不会真实的去校验/恢复数据.
    */
   private def loadLogs(): Unit = {
     info(s"Loading logs from log dirs $liveLogDirs")
@@ -310,9 +339,12 @@ class LogManager(logDirs: Seq[File],
     for (dir <- liveLogDirs) {
       val logDirAbsolutePath = dir.getAbsolutePath
       try {
+        // 对这个目录建立一个线程池, 默认应该就是1.
         val pool = Executors.newFixedThreadPool(numRecoveryThreadsPerDataDir)
         threadPools.append(pool)
 
+        // 这应该是检查logDir里面有没有.kafka_cleanshutdown文件
+        // 应该是clean关闭后, 就不恢复数据了.
         val cleanShutdownFile = new File(dir, Log.CleanShutdownFile)
         if (cleanShutdownFile.exists) {
           info(s"Skipping recovery for all logs in $logDirAbsolutePath since clean shutdown file was found")
@@ -322,6 +354,7 @@ class LogManager(logDirs: Seq[File],
           brokerState.newState(RecoveringFromUncleanShutdown)
         }
 
+        // 这应该是读取了"recovery-point-offset-checkpoint"文件, 看看里面恢复的offset, 格式应该是<tp, offset>这样.
         var recoveryPoints = Map[TopicPartition, Long]()
         try {
           recoveryPoints = this.recoveryPointCheckpoints(dir).read
@@ -331,6 +364,7 @@ class LogManager(logDirs: Seq[File],
               s"$logDirAbsolutePath, resetting the recovery checkpoint to 0", e)
         }
 
+        // 这个应该是读取了"log-start-offset-checkpoint"文件, 查看里面的startOffset什么的, 格式相似.
         var logStartOffsets = Map[TopicPartition, Long]()
         try {
           logStartOffsets = this.logStartOffsetCheckpoints(dir).read
@@ -340,10 +374,12 @@ class LogManager(logDirs: Seq[File],
               s"$logDirAbsolutePath, resetting to the base offset of the first segment", e)
         }
 
+        // 拿到所有log
         val logsToLoad = Option(dir.listFiles).getOrElse(Array.empty).filter(_.isDirectory)
         val numLogsLoaded = new AtomicInteger(0)
         numTotalLogs += logsToLoad.length
 
+        // 开始一个一个load了. 这个严格说只是把Log对象根据数据目录建立了起来, 只有我们期望的恢复offset, 还没有加载各种具体的.index文件里面的元数据啊什么的
         val jobsForDir = logsToLoad.map { logDir =>
           val runnable: Runnable = () => {
             try {
@@ -374,6 +410,7 @@ class LogManager(logDirs: Seq[File],
     }
 
     try {
+      // 这应该是校验了一下恢复的成功, 恢复好了, 然后就把每个partition目录下的cleanShutdown文件干掉了.
       for ((cleanShutdownFile, dirJobs) <- jobs) {
         dirJobs.foreach(_.get)
         try {
@@ -393,6 +430,7 @@ class LogManager(logDirs: Seq[File],
         error(s"There was an error in one of the threads during logs loading: ${e.getCause}")
         throw e.getCause
     } finally {
+      // 把恢复的线程池(也就1个)关掉.
       threadPools.foreach(_.shutdown())
     }
 
@@ -401,37 +439,41 @@ class LogManager(logDirs: Seq[File],
 
   /**
    *  Start the background threads to flush logs and do log cleanup
+   * 把后台线程都启动了, 妈的
    */
   def startup(): Unit = {
     /* Schedule the cleanup task to delete old logs */
     if (scheduler != null) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
+      // 这应该是不压缩的, 过期日志都干掉
       scheduler.schedule("kafka-log-retention",
-                         cleanupLogs _,
-                         delay = InitialTaskDelayMs,
-                         period = retentionCheckMs,
-                         TimeUnit.MILLISECONDS)
+        cleanupLogs _,
+        delay = InitialTaskDelayMs,
+        period = retentionCheckMs,
+        TimeUnit.MILLISECONDS)
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
       scheduler.schedule("kafka-log-flusher",
-                         flushDirtyLogs _,
-                         delay = InitialTaskDelayMs,
-                         period = flushCheckMs,
-                         TimeUnit.MILLISECONDS)
+        flushDirtyLogs _,
+        delay = InitialTaskDelayMs,
+        period = flushCheckMs,
+        TimeUnit.MILLISECONDS)
+      // 这个是做个一个checkpoint文件, 就是我们恢复时候读取的一个期待点, 但是我很纳闷: 数据呢?就丢掉了??
       scheduler.schedule("kafka-recovery-point-checkpoint",
-                         checkpointLogRecoveryOffsets _,
-                         delay = InitialTaskDelayMs,
-                         period = flushRecoveryOffsetCheckpointMs,
-                         TimeUnit.MILLISECONDS)
+        checkpointLogRecoveryOffsets _,
+        delay = InitialTaskDelayMs,
+        period = flushRecoveryOffsetCheckpointMs,
+        TimeUnit.MILLISECONDS)
       scheduler.schedule("kafka-log-start-offset-checkpoint",
-                         checkpointLogStartOffsets _,
-                         delay = InitialTaskDelayMs,
-                         period = flushStartOffsetCheckpointMs,
-                         TimeUnit.MILLISECONDS)
+        checkpointLogStartOffsets _,
+        delay = InitialTaskDelayMs,
+        period = flushStartOffsetCheckpointMs,
+        TimeUnit.MILLISECONDS)
       scheduler.schedule("kafka-delete-logs", // will be rescheduled after each delete logs with a dynamic period
-                         deleteLogs _,
-                         delay = InitialTaskDelayMs,
-                         unit = TimeUnit.MILLISECONDS)
+        deleteLogs _,
+        delay = InitialTaskDelayMs,
+        unit = TimeUnit.MILLISECONDS)
     }
+    // 这个是启动了压缩之后, 就会起一个清道夫线程.
     if (cleanerConfig.enableCleaner)
       cleaner.startup()
   }
@@ -562,7 +604,7 @@ class LogManager(logDirs: Seq[File],
     }
     // If the log does not exist, skip it
     if (log != null) {
-        //Abort and pause the cleaning of the log, and resume after truncation is done.
+      //Abort and pause the cleaning of the log, and resume after truncation is done.
       if (cleaner != null && !isFuture)
         cleaner.abortAndPauseCleaning(topicPartition)
       try {
@@ -601,11 +643,11 @@ class LogManager(logDirs: Seq[File],
   }
 
   /**
-    * Write the recovery checkpoint file for all logs in provided directory and clean older snapshots for provided logs.
-    *
-    * @param dir the directory in which logs are checkpointed
-    * @param logsToCleanSnapshot logs whose snapshots need to be cleaned
-    */
+   * Write the recovery checkpoint file for all logs in provided directory and clean older snapshots for provided logs.
+   *
+   * @param dir the directory in which logs are checkpointed
+   * @param logsToCleanSnapshot logs whose snapshots need to be cleaned
+   */
   // Only for testing
   private[log] def checkpointRecoveryOffsetsAndCleanSnapshot(dir: File, logsToCleanSnapshot: Seq[Log]): Unit = {
     try {
@@ -651,7 +693,7 @@ class LogManager(logDirs: Seq[File],
   def maybeUpdatePreferredLogDir(topicPartition: TopicPartition, logDir: String): Unit = {
     // Do not cache the preferred log directory if either the current log or the future log for this partition exists in the specified logDir
     if (!getLog(topicPartition).exists(_.parentDir == logDir) &&
-        !getLog(topicPartition, isFuture = true).exists(_.parentDir == logDir))
+      !getLog(topicPartition, isFuture = true).exists(_.parentDir == logDir))
       preferredLogDirs.put(topicPartition, logDir)
   }
 
@@ -861,11 +903,11 @@ class LogManager(logDirs: Seq[File],
   }
 
   /**
-    * Mark the partition directory in the source log directory for deletion and
-    * rename the future log of this partition in the destination log directory to be the current log
-    *
-    * @param topicPartition TopicPartition that needs to be swapped
-    */
+   * Mark the partition directory in the source log directory for deletion and
+   * rename the future log of this partition in the destination log directory to be the current log
+   *
+   * @param topicPartition TopicPartition that needs to be swapped
+   */
   def replaceCurrentWithFutureLog(topicPartition: TopicPartition): Unit = {
     logCreationOrDeletionLock synchronized {
       val sourceLog = currentLogs.get(topicPartition)
@@ -912,13 +954,13 @@ class LogManager(logDirs: Seq[File],
   }
 
   /**
-    * Rename the directory of the given topic-partition "logdir" as "logdir.uuid.delete" and
-    * add it in the queue for deletion.
-    *
-    * @param topicPartition TopicPartition that needs to be deleted
-    * @param isFuture True iff the future log of the specified partition should be deleted
-    * @return the removed log
-    */
+   * Rename the directory of the given topic-partition "logdir" as "logdir.uuid.delete" and
+   * add it in the queue for deletion.
+   *
+   * @param topicPartition TopicPartition that needs to be deleted
+   * @param isFuture True iff the future log of the specified partition should be deleted
+   * @return the removed log
+   */
   def asyncDelete(topicPartition: TopicPartition, isFuture: Boolean = false): Log = {
     val removedLog: Log = logCreationOrDeletionLock synchronized {
       if (isFuture)
@@ -1005,7 +1047,7 @@ class LogManager(logDirs: Seq[File],
     }
 
     debug(s"Log cleanup completed. $total files deleted in " +
-                  (time.milliseconds - startMs) / 1000 + " seconds")
+      (time.milliseconds - startMs) / 1000 + " seconds")
   }
 
   /**
@@ -1054,7 +1096,7 @@ class LogManager(logDirs: Seq[File],
       try {
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
         debug(s"Checking if flush is needed on ${topicPartition.topic} flush interval ${log.config.flushMs}" +
-              s" last flushed ${log.lastFlushTime} time since last flush: $timeSinceLastFlush")
+          s" last flushed ${log.lastFlushTime} time since last flush: $timeSinceLastFlush")
         if(timeSinceLastFlush >= log.config.flushMs)
           log.flush
       } catch {
@@ -1071,19 +1113,26 @@ object LogManager {
   val LogStartOffsetCheckpointFile = "log-start-offset-checkpoint"
   val ProducerIdExpirationCheckIntervalMs = 10 * 60 * 1000
 
-  def apply(config: KafkaConfig,
-            initialOfflineDirs: Seq[String],
-            zkClient: KafkaZkClient,
-            brokerState: BrokerState,
-            kafkaScheduler: KafkaScheduler,
-            time: Time,
-            brokerTopicStats: BrokerTopicStats,
-            logDirFailureChannel: LogDirFailureChannel): LogManager = {
+
+  // 反正我理解的, kafkaServer的初始化方法里面的创建logManager对象的入口就是这里了.
+  def apply(
+             config: KafkaConfig,   // 全部的配置
+             initialOfflineDirs: Seq[String], // 下线的logDir集合, 一般没有, 这个是刚开始读logDir里面的meta.properties时候整理的下线集合.
+             zkClient: KafkaZkClient, // 这是一个zkClient, 没看里面的具体内容, 就大概看成是一个zkClient就好了, 以后看zk的时候有时间再看
+             brokerState: BrokerState, // 这个是当前broker的state, 很简单的一个状态, 应该是starting状态才会进来..
+             kafkaScheduler: KafkaScheduler, // 这个就是一个JUC的定时任务线程池.
+             time: Time,
+             brokerTopicStats: BrokerTopicStats, // 这个也是一个状态, 但不知道有什么用.
+             logDirFailureChannel: LogDirFailureChannel // 这个是一个下线的logDir的集合.
+           ): LogManager = {
+
+    // 这个是拿到了log的默认配置
     val defaultProps = KafkaServer.copyKafkaConfigToLog(config)
 
     LogConfig.validateValues(defaultProps)
     val defaultLogConfig = LogConfig(defaultProps)
 
+    // 这又从zk上拿了一遍配置.
     // read the log configurations from zookeeper
     val (topicConfigs, failed) = zkClient.getLogConfigs(
       zkClient.getAllTopicsInCluster(),
@@ -1091,9 +1140,14 @@ object LogManager {
     )
     if (!failed.isEmpty) throw failed.head._2
 
+    // 从配置上提取出来了compact模式清道夫的配置
     val cleanerConfig = LogCleaner.cleanerConfig(config)
 
-    new LogManager(logDirs = config.logDirs.map(new File(_).getAbsoluteFile),
+    // 创建返回一个logManager
+    new LogManager(
+      // 1. 这个是所有的logDir, 一般就一个.
+      logDirs = config.logDirs.map(new File(_).getAbsoluteFile),
+      // 2. 下显得logDir
       initialOfflineDirs = initialOfflineDirs.map(new File(_).getAbsoluteFile),
       topicConfigs = topicConfigs,
       initialDefaultConfig = defaultLogConfig,
@@ -1102,6 +1156,7 @@ object LogManager {
       flushCheckMs = config.logFlushSchedulerIntervalMs,
       flushRecoveryOffsetCheckpointMs = config.logFlushOffsetCheckpointIntervalMs,
       flushStartOffsetCheckpointMs = config.logFlushStartOffsetCheckpointIntervalMs,
+      // 我理解是保留数据的检查时间间隔
       retentionCheckMs = config.logCleanupIntervalMs,
       maxPidExpirationMs = config.transactionalIdExpirationMs,
       scheduler = kafkaScheduler,

@@ -2464,6 +2464,7 @@ object Log {
    * avoided by passing in the recovery point, however finding the correct position to do this
    * requires accessing the offset index which may not be safe in an unclean shutdown.
    * For more information see the discussion in PR#2104
+   * 应该是clean关闭后, 就不恢复数据了.
    */
   val CleanShutdownFile = ".kafka_cleanshutdown"
 
@@ -2636,6 +2637,7 @@ object Log {
       if (dirName.endsWith(DeleteDirSuffix) || dirName.endsWith(FutureDirSuffix)) dirName.substring(0, dirName.lastIndexOf('.'))
       else dirName
 
+    // 文件名字应该是 {topicName}-{partition}.log这样子
     val index = name.lastIndexOf('-')
     val topic = name.substring(0, index)
     val partitionString = name.substring(index + 1)
