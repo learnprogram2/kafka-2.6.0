@@ -33,10 +33,29 @@ import kafka.utils.Logging
  * can take the name of the new offline log directory out of the LogDirFailureChannel and handle the log failure properly.
  * An offline log directory will stay offline until the broker is restarted.
  *
+   logDirFailureChannel应该是一个全局的directory离线后的降级方案:
+  有了出现IOException的目录就可以放进来.
+
+  -- 放进来有毛用? 就是可以让外部的线程阻塞拿到它们, 然后做什么什么处理. 这就是下线dir一家人集合处.
+
+  下面是翻译.
+     LogDirFailureChannel 允许外部线程阻塞等待新的离线日志目录。
+
+     应该有一个 LogDirFailureChannel 实例可供任何执行磁盘 IO 操作的类访问。
+
+     如果在访问日志目录时遇到IOException，相应的类可以使用maybeAddOfflineLogDir()将日志目录名称添加到LogDirFailureChannel。
+
+     每个日志目录只会添加一次。
+     首次添加日志目录后，被阻塞等待新的离线日志目录的线程可以从LogDirFailureChannel中取出新的离线日志目录的名称，正确处理日志失败。
+
+     离线日志目录将保持离线状态，直到代理重新启动。
+
+
  */
 class LogDirFailureChannel(logDirNum: Int) extends Logging {
 
   private val offlineLogDirs = new ConcurrentHashMap[String, String]
+  // 这个是logDir的size大小的队列, 最多就是全部目录都下线了.
   private val offlineLogDirQueue = new ArrayBlockingQueue[String](logDirNum)
 
   /*
