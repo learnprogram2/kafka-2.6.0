@@ -29,6 +29,8 @@ import org.slf4j.spi.LocationAwareLogger;
  * the groupId of the consumer, so this can be added to a context object which can then be passed to
  * all of the dependent components in order to build new loggers. This removes the need to manually
  * add the groupId to each message.
+ *
+ * 这个类就是给所有的logger加了一个公共前缀, 没有什么特别的意义
  */
 public class LogContext {
 
