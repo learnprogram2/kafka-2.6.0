@@ -164,6 +164,8 @@ object ReplicaManager {
   val IsrChangePropagationInterval = 60000L
 }
 
+// 这个类的主要功能:
+//
 class ReplicaManager(val config: KafkaConfig,
                      metrics: Metrics,
                      time: Time,
@@ -195,29 +197,41 @@ class ReplicaManager(val config: KafkaConfig,
            threadNamePrefix: Option[String] = None) = {
     this(config, metrics, time, zkClient, scheduler, logManager, isShuttingDown,
       quotaManagers, brokerTopicStats, metadataCache, logDirFailureChannel,
+
+      // 这是喀喀喀创建了四个时间轮: 时间轮的主要目的应该是:
+      // 1. 和produce相关的定时
       DelayedOperationPurgatory[DelayedProduce](
         purgatoryName = "Produce", brokerId = config.brokerId,
         purgeInterval = config.producerPurgatoryPurgeIntervalRequests),
+      // 2. 很明显, 和集群的fetch相关的定时.
       DelayedOperationPurgatory[DelayedFetch](
         purgatoryName = "Fetch", brokerId = config.brokerId,
         purgeInterval = config.fetchPurgatoryPurgeIntervalRequests),
+      // 3. 这是删除record? 干什么的, 和log过期压缩什么的定时任务都在logManger里面啊
       DelayedOperationPurgatory[DelayedDeleteRecords](
         purgatoryName = "DeleteRecords", brokerId = config.brokerId,
         purgeInterval = config.deleteRecordsPurgatoryPurgeIntervalRequests),
+      // 4. 这个是leader选举? 怎么选举还要定时呢?
       DelayedOperationPurgatory[DelayedElectLeader](
         purgatoryName = "ElectLeader", brokerId = config.brokerId),
       threadNamePrefix)
   }
 
-  /* epoch of the controller that last changed the leader */
+  /* epoch of the controller that last changed the leader: 这个是...*/
   @volatile var controllerEpoch: Int = KafkaController.InitialControllerEpoch
   private val localBrokerId = config.brokerId
+  // 这个里面存着我们所有的partition: 这应该是一个带着处理方法的map
   private val allPartitions = new Pool[TopicPartition, HostedPartition](
     valueFactory = Some(tp => HostedPartition.Online(Partition(tp, time, this)))
   )
   private val replicaStateChangeLock = new Object
+
+  // 这个是fetcherManager
   val replicaFetcherManager = createReplicaFetcherManager(metrics, time, threadNamePrefix, quotaManagers.follower)
+  // 这个是dir变更的, 应该很少用吧
   val replicaAlterLogDirsManager = createReplicaAlterLogDirsManager(quotaManagers.alterLogDirs, brokerTopicStats)
+
+  // 这个是HW相关的: 做checkpoint的线程, 和一个map,对应着所有的partition的checkpoint(快照)文件地址. 应该是每个partition文件夹下面创建一个'replication-offset-checkpoint'文件夹
   private val highWatermarkCheckPointThreadStarted = new AtomicBoolean(false)
   @volatile var highWatermarkCheckpoints: Map[String, OffsetCheckpointFile] = logManager.liveLogDirs.map(dir =>
     (dir.getAbsolutePath, new OffsetCheckpointFile(new File(dir, ReplicaManager.HighWatermarkFilename), logDirFailureChannel))).toMap
@@ -225,10 +239,12 @@ class ReplicaManager(val config: KafkaConfig,
   this.logIdent = s"[ReplicaManager broker=$localBrokerId] "
   private val stateChangeLogger = new StateChangeLogger(localBrokerId, inControllerContext = false, None)
 
+  // ISR相关的???
   private val isrChangeSet: mutable.Set[TopicPartition] = new mutable.HashSet[TopicPartition]()
   private val lastIsrChangeMs = new AtomicLong(System.currentTimeMillis())
   private val lastIsrPropagationMs = new AtomicLong(System.currentTimeMillis())
 
+  // 这个handler(线程)在阻塞的拿logDirFailureChannel里面下线的LogDir, 然后处理
   private var logDirFailureHandler: LogDirFailureHandler = null
 
   private class LogDirFailureHandler(name: String, haltBrokerOnDirFailure: Boolean) extends ShutdownableThread(name) {
@@ -242,6 +258,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  // 这个是干什么? 成为kafkaController之后的??
   // Visible for testing
   private[server] val replicaSelectorOpt: Option[ReplicaSelector] = createReplicaSelector()
 
@@ -262,11 +279,13 @@ class ReplicaManager(val config: KafkaConfig,
 
   def underReplicatedPartitionCount: Int = leaderPartitionsIterator.count(_.isUnderReplicated)
 
+  // 这个是把所有partition的HW, 写道partition目录下面的HW文件上去" Flushes the highwatermark value for all partitions to the highwatermark file
   def startHighWatermarkCheckPointThread(): Unit = {
     if (highWatermarkCheckPointThreadStarted.compareAndSet(false, true))
       scheduler.schedule("highwatermark-checkpoint", checkpointHighWatermarks _, period = config.replicaHighWatermarkCheckpointIntervalMs, unit = TimeUnit.MILLISECONDS)
   }
 
+  // 记录一下ISR变动的TPartition
   def recordIsrChange(topicPartition: TopicPartition): Unit = {
     isrChangeSet synchronized {
       isrChangeSet += topicPartition
@@ -274,10 +293,13 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
   /**
+   * 定时, 检查ISR是否需要传播.
+   * 1. 如果ISRChangeSet里面有没有传完的, 要传播
+   * 2. 如果超过60s, 也会传播.
    * This function periodically runs to see if ISR needs to be propagated. It propagates ISR when:
    * 1. There is ISR change not propagated yet.
    * 2. There is no ISR Change in the last five seconds, or it has been more than 60 seconds since the last ISR propagation.
-   * This allows an occasional ISR change to be propagated within a few seconds, and avoids overwhelming controller and
+   * This allows an occasional(偶尔) ISR change to be propagated within a few seconds, and avoids overwhelming controller and
    * other brokers when large amount of ISR change occurs.
    */
   def maybePropagateIsrChanges(): Unit = {
@@ -293,6 +315,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
+  // 和fetch相关的
   // When ReplicaAlterDirThread finishes replacing a current replica with a future replica, it will
   // remove the partition from the partition state map. But it will not close itself even if the
   // partition state map is empty. Thus we need to call shutdownIdleReplicaAlterDirThread() periodically
@@ -310,13 +333,17 @@ class ReplicaManager(val config: KafkaConfig,
     debug("Request key %s unblocked %d ElectLeader.".format(key.keyLabel, completed))
   }
 
+
+  // 启动方法!!!!!!!!!!! 维护ISR列表, 搞了个输出错误的降级方法
   def startup(): Unit = {
+    // ISR的维护定时任务.
     // start ISR expiration thread
     // A follower can lag behind leader for up to config.replicaLagTimeMaxMs x 1.5 before it is removed from ISR
     scheduler.schedule("isr-expiration", maybeShrinkIsr _, period = config.replicaLagTimeMaxMs / 2, unit = TimeUnit.MILLISECONDS)
     scheduler.schedule("isr-change-propagation", maybePropagateIsrChanges _, period = 2500L, unit = TimeUnit.MILLISECONDS)
     scheduler.schedule("shutdown-idle-replica-alter-log-dirs-thread", shutdownIdleReplicaAlterLogDirsThread _, period = 10000L, unit = TimeUnit.MILLISECONDS)
 
+    // 这个要处理下线的logDir, 不知道有什么用.
     // If inter-broker protocol (IBP) < 1.0, the controller will send LeaderAndIsrRequest V0 which does not include isNew field.
     // In this case, the broker receiving the request cannot determine whether it is safe to create a partition if a log directory has failed.
     // Thus, we choose to halt the broker on any log diretory failure if IBP < 1.0
@@ -412,8 +439,8 @@ class ReplicaManager(val config: KafkaConfig,
               // When an older version of the StopReplica request which does not contain the leader
               // epoch, a sentinel value (NoEpoch) is used and bypass the epoch validation.
               if (requestLeaderEpoch == LeaderAndIsr.EpochDuringDelete ||
-                  requestLeaderEpoch == LeaderAndIsr.NoEpoch ||
-                  requestLeaderEpoch > currentLeaderEpoch) {
+                requestLeaderEpoch == LeaderAndIsr.NoEpoch ||
+                requestLeaderEpoch > currentLeaderEpoch) {
                 stoppedPartitions += topicPartition -> partitionState
               } else if (requestLeaderEpoch < currentLeaderEpoch) {
                 stateChangeLogger.warn(s"Ignoring StopReplica request (delete=$deletePartition) from " +
@@ -556,6 +583,10 @@ class ReplicaManager(val config: KafkaConfig,
    * Append messages to leader replicas of the partition, and wait for them to be replicated to other replicas;
    * the callback function will be triggered either when timeout or the required acks are satisfied;
    * if the callback function itself is already synchronized on some object then pass this object to avoid deadlock.
+
+      这个最重要:
+      1. 把partition的数据添加好, 等待同步到follower partition上面.
+      2. 有返回/超时之后就调用callBack方法.
    */
   def appendRecords(timeout: Long,
                     requiredAcks: Short,
@@ -565,23 +596,26 @@ class ReplicaManager(val config: KafkaConfig,
                     responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
                     delayedProduceLock: Option[Lock] = None,
                     recordConversionStatsCallback: Map[TopicPartition, RecordConversionStats] => Unit = _ => ()): Unit = {
+    // 校验acks只能是all或者是1.
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
+      // 1. 先添加到local磁盘上去
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         origin, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
 
       val produceStatus = localProduceResults.map { case (topicPartition, result) =>
         topicPartition ->
-                ProducePartitionStatus(
-                  result.info.lastOffset + 1, // required offset
-                  new PartitionResponse(result.error, result.info.firstOffset.getOrElse(-1), result.info.logAppendTime,
-                    result.info.logStartOffset, result.info.recordErrors.asJava, result.info.errorMessage)) // response status
+          ProducePartitionStatus(
+            result.info.lastOffset + 1, // required offset
+            new PartitionResponse(result.error, result.info.firstOffset.getOrElse(-1), result.info.logAppendTime,
+              result.info.logStartOffset, result.info.recordErrors.asJava, result.info.errorMessage)) // response status
       }
 
       recordConversionStatsCallback(localProduceResults.map { case (k, v) => k -> v.info.recordConversionStats })
 
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
+        // 有数据需要同步follower
         // create delayed produce operation
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
@@ -829,6 +863,7 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   // If all the following conditions are true, we need to put a delayed produce request and wait for replication to complete
+  // 如果需要全部都同步, 然后有data, 并且至少有一个partition写成功了, 我们就需要,,,(等一会???)
   //
   // 1. required acks = -1
   // 2. there is data to append
@@ -837,8 +872,8 @@ class ReplicaManager(val config: KafkaConfig,
                                             entriesPerPartition: Map[TopicPartition, MemoryRecords],
                                             localProduceResults: Map[TopicPartition, LogAppendResult]): Boolean = {
     requiredAcks == -1 &&
-    entriesPerPartition.nonEmpty &&
-    localProduceResults.values.count(_.exception.isDefined) < entriesPerPartition.size
+      entriesPerPartition.nonEmpty &&
+      localProduceResults.values.count(_.exception.isDefined) < entriesPerPartition.size
   }
 
   private def isValidRequiredAcks(requiredAcks: Short): Boolean = {
@@ -847,6 +882,7 @@ class ReplicaManager(val config: KafkaConfig,
 
   /**
    * Append the messages to the local replica logs
+
    */
   private def appendToLocalLog(internalTopicsAllowed: Boolean,
                                origin: AppendOrigin,
@@ -879,8 +915,11 @@ class ReplicaManager(val config: KafkaConfig,
           Some(new InvalidTopicException(s"Cannot append to internal topic ${topicPartition.topic}"))))
       } else {
         try {
+          // 这里是对一个topic的一个partition的正常添加!!!!
           val partition = getPartitionOrException(topicPartition)
-          val info = partition.appendRecordsToLeader(records, origin, requiredAcks)
+          // TODO: 调用partition的appendRecordsToLeader
+          val info = partition.appendRecordsToLeader(records, origin, requiredAcks) // orgin是这些records的来源, 是client
+          // 添加了这么多条
           val numAppendedMessages = info.numMessages
 
           // update stats for successfully appended bytes and messages as bytesInRate and messageInRate
@@ -1157,10 +1196,10 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   /**
-    * Using the configured [[ReplicaSelector]], determine the preferred read replica for a partition given the
-    * client metadata, the requested offset, and the current set of replicas. If the preferred read replica is the
-    * leader, return None
-    */
+   * Using the configured [[ReplicaSelector]], determine the preferred read replica for a partition given the
+   * client metadata, the requested offset, and the current set of replicas. If the preferred read replica is the
+   * leader, return None
+   */
   def findPreferredReadReplica(partition: Partition,
                                clientMetadata: ClientMetadata,
                                replicaId: Int,
@@ -1575,7 +1614,7 @@ class ReplicaManager(val config: KafkaConfig,
             .brokerEndPoint(config.interBrokerListenerName)
           val fetchOffset = partition.localLogOrException.highWatermark
           partition.topicPartition -> InitialFetchState(leader, partition.getLeaderEpoch, fetchOffset)
-       }.toMap
+        }.toMap
 
         replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
       }
@@ -1712,7 +1751,7 @@ class ReplicaManager(val config: KafkaConfig,
       highWatermarkCheckpoints = highWatermarkCheckpoints.filter { case (checkpointDir, _) => checkpointDir != dir }
 
       warn(s"Broker $localBrokerId stopped fetcher for partitions ${newOfflinePartitions.mkString(",")} and stopped moving logs " +
-           s"for partitions ${partitionsWithOfflineFutureReplica.mkString(",")} because they are in the failed log directory $dir.")
+        s"for partitions ${partitionsWithOfflineFutureReplica.mkString(",")} because they are in the failed log directory $dir.")
     }
     logManager.handleLogDirFailure(dir)
 
@@ -1786,12 +1825,12 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   def electLeaders(
-    controller: KafkaController,
-    partitions: Set[TopicPartition],
-    electionType: ElectionType,
-    responseCallback: Map[TopicPartition, ApiError] => Unit,
-    requestTimeout: Int
-  ): Unit = {
+                    controller: KafkaController,
+                    partitions: Set[TopicPartition],
+                    electionType: ElectionType,
+                    responseCallback: Map[TopicPartition, ApiError] => Unit,
+                    requestTimeout: Int
+                  ): Unit = {
 
     val deadline = time.milliseconds() + requestTimeout
 
@@ -1819,8 +1858,8 @@ class ReplicaManager(val config: KafkaConfig,
           watchKeys
         )
       } else {
-          // There are no partitions actually being elected, so return immediately
-          responseCallback(failures)
+        // There are no partitions actually being elected, so return immediately
+        responseCallback(failures)
       }
     }
 
